@@ -1,0 +1,6 @@
+torch>=2.1
+pandas>=2.0
+numpy>=1.24
+tqdm>=4.66
+wandb>=0.17
+nvidia-ml-py>=12
