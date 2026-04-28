@@ -41,7 +41,7 @@ class MultiHeadSelfAttention(nn.Module):
         scores = Q @ K.transpose(-2, -1)
         # scores: [B, num_heads, L, L]
 
-        scores = scores / (self.head_dim ** 0.5)
+        scores = scores / (self.head_dim**0.5)
 
         padding_mask = item_seq != 0
         # [B, L]
@@ -49,9 +49,7 @@ class MultiHeadSelfAttention(nn.Module):
         padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)
         # [B, 1, 1, L]
 
-        causal_mask = torch.tril(
-            torch.ones(L, L, device=x.device, dtype=torch.bool)
-        )
+        causal_mask = torch.tril(torch.ones(L, L, device=x.device, dtype=torch.bool))
         # [L, L]
 
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
@@ -85,7 +83,7 @@ class MultiHeadSelfAttention(nn.Module):
         out = out * query_mask
 
         return out
-    
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout):
@@ -94,9 +92,7 @@ class TransformerBlock(nn.Module):
         self.attn_norm = nn.LayerNorm(hidden_size)
 
         self.attention = MultiHeadSelfAttention(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout
+            hidden_size=hidden_size, num_heads=num_heads, dropout=dropout
         )
 
         self.ffn_norm = nn.LayerNorm(hidden_size)
@@ -127,7 +123,7 @@ class TransformerBlock(nn.Module):
         x = x * query_mask
 
         return x
-    
+
 
 class SASRec(nn.Module):
     def __init__(
@@ -145,27 +141,20 @@ class SASRec(nn.Module):
         self.hidden_size = hidden_size
         self.max_seq_len = max_seq_len
 
-        self.item_embedding = nn.Embedding(
-            num_items + 1,
-            hidden_size,
-            padding_idx=0
-        )
+        self.item_embedding = nn.Embedding(num_items + 1, hidden_size, padding_idx=0)
 
-        self.position_embedding = nn.Embedding(
-            max_seq_len,
-            hidden_size
-        )
+        self.position_embedding = nn.Embedding(max_seq_len, hidden_size)
 
         self.embedding_dropout = nn.Dropout(dropout)
 
-        self.blocks = nn.ModuleList([
-            TransformerBlock(
-                hidden_size=hidden_size,
-                num_heads=num_heads,
-                dropout=dropout
-            )
-            for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    hidden_size=hidden_size, num_heads=num_heads, dropout=dropout
+                )
+                for _ in range(num_layers)
+            ]
+        )
 
         self.final_norm = nn.LayerNorm(hidden_size)
 
@@ -221,13 +210,11 @@ class SASRec(nn.Module):
         # считаем loss только там, где есть настоящий positive item
 
         pos_loss = F.binary_cross_entropy_with_logits(
-            pos_logits[valid_mask],
-            torch.ones_like(pos_logits[valid_mask])
+            pos_logits[valid_mask], torch.ones_like(pos_logits[valid_mask])
         )
 
         neg_loss = F.binary_cross_entropy_with_logits(
-            neg_logits[valid_mask],
-            torch.zeros_like(neg_logits[valid_mask])
+            neg_logits[valid_mask], torch.zeros_like(neg_logits[valid_mask])
         )
 
         loss = pos_loss + neg_loss
@@ -247,10 +234,7 @@ class SASRec(nn.Module):
         candidate_emb = self.item_embedding(candidate_items)
         # [B, N, H]
 
-        scores = torch.matmul(
-            candidate_emb,
-            last_hidden.unsqueeze(-1)
-        ).squeeze(-1)
+        scores = torch.matmul(candidate_emb, last_hidden.unsqueeze(-1)).squeeze(-1)
 
         # scores: [B, N]
 
@@ -274,5 +258,69 @@ class SASRec(nn.Module):
         scores[:, 0] = -1e9
 
         return scores
-    
 
+
+import copy
+
+
+class StackedSASRec(SASRec):
+    def __init__(
+        self,
+        item_num,
+        maxlen,
+        hidden_units,
+        num_blocks,
+        num_heads,
+        dropout_rate,
+    ):
+        super().__init__(
+            item_num=item_num,
+            maxlen=maxlen,
+            hidden_units=hidden_units,
+            num_blocks=num_blocks,
+            num_heads=num_heads,
+            dropout_rate=dropout_rate,
+        )
+
+    @property
+    def num_transformer_blocks(self):
+        return len(self.blocks)
+
+    def double_blocks(self, max_blocks=None, mode="append"):
+        old_num_blocks = len(self.blocks)
+
+        if max_blocks is None:
+            target_num_blocks = old_num_blocks * 2
+        else:
+            target_num_blocks = min(old_num_blocks * 2, max_blocks)
+
+        if target_num_blocks <= old_num_blocks:
+            return False
+
+        old_blocks = list(self.blocks)
+        new_blocks = torch.nn.ModuleList()
+
+        if mode == "append":
+            for block in old_blocks:
+                new_blocks.append(block)
+
+            idx = 0
+            while len(new_blocks) < target_num_blocks:
+                new_blocks.append(copy.deepcopy(old_blocks[idx]))
+                idx += 1
+
+        elif mode == "interleave":
+            for block in old_blocks:
+                if len(new_blocks) < target_num_blocks:
+                    new_blocks.append(block)
+                if len(new_blocks) < target_num_blocks:
+                    new_blocks.append(copy.deepcopy(block))
+
+        else:
+            raise ValueError(f"Unknown stacking mode: {mode}")
+
+        self.blocks = new_blocks
+
+        print(f"Stacking: transformer blocks {old_num_blocks} -> {len(self.blocks)}")
+
+        return True

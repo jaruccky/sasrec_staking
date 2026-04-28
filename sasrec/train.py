@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from sasrec.model import SASRec
+from sasrec.model import SASRec, StackedSASRec
 from sasrec.data import (
     download_and_preprocess,
     load_data,
@@ -25,7 +25,9 @@ from sasrec.evaluate import evaluate, validate_fast
 def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def train_one_epoch(
@@ -61,6 +63,7 @@ def train_one_epoch(
                     negatives=negatives,
                     item_emb=model.item_emb,
                 )
+
             elif loss_type == "bce":
                 loss = compute_sampled_bce_loss(
                     hidden=hidden,
@@ -68,6 +71,7 @@ def train_one_epoch(
                     negatives=negatives,
                     item_emb=model.item_emb,
                 )
+
             else:
                 raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -98,7 +102,10 @@ def parse_args():
 
     parser.add_argument("--data_path", type=str, default=None)
     parser.add_argument(
-        "--dataset", type=str, default="ml-20m", choices=["ml-1m", "ml-20m"]
+        "--dataset",
+        type=str,
+        default="ml-20m",
+        choices=["ml-1m", "ml-20m"],
     )
     parser.add_argument("--data_dir", type=str, default="data")
 
@@ -109,7 +116,10 @@ def parse_args():
     parser.add_argument("--max_length", type=int, default=200)
 
     parser.add_argument(
-        "--loss", type=str, default="cross_entropy", choices=["cross_entropy", "bce"]
+        "--loss",
+        type=str,
+        default="cross_entropy",
+        choices=["cross_entropy", "bce"],
     )
     parser.add_argument("--num_negatives", type=int, default=None)
     parser.add_argument("--full_negative_sampling", action="store_true")
@@ -129,7 +139,43 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
 
+    # stacking params
+    parser.add_argument("--use_stacking", action="store_true")
+    parser.add_argument("--stack_every", type=int, default=5)
+    parser.add_argument("--stack_max_blocks", type=int, default=None)
+    parser.add_argument(
+        "--stack_mode",
+        type=str,
+        default="append",
+        choices=["append", "interleave"],
+    )
+
     return parser.parse_args()
+
+
+def create_model(args, num_items, num_blocks):
+    model_cls = StackedSASRec if args.use_stacking else SASRec
+
+    model = model_cls(
+        item_num=num_items,
+        maxlen=args.max_length,
+        hidden_units=args.hidden_units,
+        num_blocks=num_blocks,
+        num_heads=args.num_heads,
+        dropout_rate=args.dropout_rate,
+    )
+
+    return model
+
+
+def create_optimizer(args, model):
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    return optimizer
 
 
 def main():
@@ -167,12 +213,13 @@ def main():
     train_sequences = list(train_sequences.values())
 
     use_sampling = args.num_negatives is not None
+    full_negative_sampling = args.full_negative_sampling if use_sampling else False
 
     train_dataset = CausalLMDataset(
         user_sequences=train_sequences,
         max_length=args.max_length,
         num_negatives=args.num_negatives,
-        full_negative_sampling=args.full_negative_sampling,
+        full_negative_sampling=full_negative_sampling,
         num_items=num_items,
     )
 
@@ -186,23 +233,17 @@ def main():
         drop_last=False,
     )
 
-    model = SASRec(
-        item_num=num_items,
-        maxlen=args.max_length,
-        hidden_units=args.hidden_units,
+    model = create_model(
+        args=args,
+        num_items=num_items,
         num_blocks=args.num_blocks,
-        num_heads=args.num_heads,
-        dropout_rate=args.dropout_rate,
     ).to(device)
+
+    optimizer = create_optimizer(args, model)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {num_params:,}")
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    print(f"Initial transformer blocks: {len(model.blocks)}")
 
     os.makedirs(args.save_dir, exist_ok=True)
     best_path = os.path.join(args.save_dir, "best_model.pt")
@@ -249,14 +290,27 @@ def main():
         if val_ndcg > best_ndcg:
             best_ndcg = val_ndcg
             epochs_no_improve = 0
-            torch.save(model.state_dict(), best_path)
+
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "num_blocks": len(model.blocks),
+                    "args": vars(args),
+                    "best_ndcg": best_ndcg,
+                    "epoch": epoch,
+                },
+                best_path,
+            )
+
             marker = " * saved"
+
         else:
             epochs_no_improve += 1
             marker = ""
 
         print(
             f"Epoch {epoch:03d}/{args.max_epochs} | "
+            f"blocks={len(model.blocks)} | "
             f"loss={train_loss:.4f} | "
             f"val HR@10={val_hr:.4f} | "
             f"val NDCG@10={val_ndcg:.4f} | "
@@ -267,6 +321,24 @@ def main():
         if epochs_no_improve >= args.patience:
             print(f"\nEarly stopping: no improvement for {args.patience} epochs")
             break
+
+        if args.use_stacking and epoch % args.stack_every == 0:
+            grew = model.double_blocks(
+                max_blocks=args.stack_max_blocks,
+                mode=args.stack_mode,
+            )
+
+            if grew:
+                model = model.to(device)
+                optimizer = create_optimizer(args, model)
+
+                num_params = sum(p.numel() for p in model.parameters())
+
+                print(
+                    f"Optimizer recreated after stacking | "
+                    f"blocks={len(model.blocks)} | "
+                    f"params={num_params:,}"
+                )
 
     total_time = time.time() - total_start
 
@@ -280,7 +352,21 @@ def main():
     print("Load best model")
     print("=" * 80)
 
-    model.load_state_dict(torch.load(best_path, map_location=device))
+    checkpoint = torch.load(best_path, map_location=device)
+
+    best_num_blocks = checkpoint["num_blocks"]
+
+    model = create_model(
+        args=args,
+        num_items=num_items,
+        num_blocks=best_num_blocks,
+    ).to(device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    print(f"Loaded best model from epoch {checkpoint['epoch']}")
+    print(f"Best model blocks: {best_num_blocks}")
+    print(f"Best model NDCG@10: {checkpoint['best_ndcg']:.4f}")
 
     print("\n" + "=" * 80)
     print("Test evaluation")
